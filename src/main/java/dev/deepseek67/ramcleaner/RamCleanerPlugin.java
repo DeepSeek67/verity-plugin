@@ -1,6 +1,7 @@
 package dev.deepseek67.ramcleaner;
 
 import org.bukkit.Bukkit;
+import org.bukkit.Chunk;
 import org.bukkit.ChatColor;
 import org.bukkit.World;
 import org.bukkit.command.Command;
@@ -19,8 +20,11 @@ import org.bukkit.scheduler.BukkitTask;
 
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -28,17 +32,19 @@ import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * RamCleaner - lightweight Paper server memory/AI optimizer.
+ * RamCleaner - Paper 1.21.11 memory-pressure optimizer.
  *
- * Java cannot guarantee that a requested GC reclaims a particular number of
- * bytes. This plugin therefore reports only measured heap reduction and never
- * invents a freed-memory value.
+ * Important: Java does not provide a truthful API that can guarantee a specific
+ * number of bytes will be returned to the operating system. This plugin never
+ * invents a freed-RAM number. /ramclean performs real server-side cleanup first
+ * (safe unused chunk unloading), then requests GC and measures the heap again.
  */
 public final class RamCleanerPlugin extends JavaPlugin implements Listener, CommandExecutor {
     private static final long AI_PERIOD_TICKS = 10L;
+    private static final int CHUNKS_PER_TICK = 128;
+    private static final int GC_PASSES = 4;
     private static final long MB = 1024L * 1024L;
 
-    /* Weak keys ensure the plugin does not keep unloaded mobs alive. */
     private final Map<Mob, Boolean> originalAware =
             Collections.synchronizedMap(new WeakHashMap<>());
     private final AtomicBoolean cleaning = new AtomicBoolean(false);
@@ -58,7 +64,7 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
 
         aiTask = Bukkit.getScheduler().runTaskTimer(
                 this, this::updateMobAI, AI_PERIOD_TICKS, AI_PERIOD_TICKS);
-        getLogger().info("RamCleaner enabled: adaptive mob AI + measured heap cleanup.");
+        getLogger().info("RamCleaner enabled: safe chunk reclamation + adaptive mob AI + measured GC.");
     }
 
     @Override
@@ -93,10 +99,7 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
         }
     }
 
-    /**
-     * Only lets a mob stay aware when a currently tracking player can actually
-     * see it. Paper's tracking set avoids a full mobs x players distance scan.
-     */
+    /** Disables mob AI when no online player can currently see the mob. */
     private void updateMobAI() {
         synchronized (originalAware) {
             Iterator<Map.Entry<Mob, Boolean>> iterator = originalAware.entrySet().iterator();
@@ -158,53 +161,138 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
             return;
         }
 
-        MemorySnapshot before = MemorySnapshot.capture();
-        long collectionsBefore = totalCollections();
+        final MemorySnapshot before = MemorySnapshot.capture();
+        final long collectionsBefore = totalCollections();
+        final long startNanos = System.nanoTime();
+        final CleanupStats stats = new CleanupStats();
+
         sender.sendMessage(ChatColor.AQUA + "[RamCleaner] " + ChatColor.GRAY
-                + "Starting aggressive measured cleanup...");
+                + "Aggressive cleanup started: unloading every safe unused loaded chunk, then forcing measured GC passes...");
 
-        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-            try {
-                System.gc();
-                pause(150L);
-                System.gc();
-                pause(250L);
-                System.gc();
-                pause(400L);
+        // Chunk unloading and Bukkit world access stay on the server thread.
+        Bukkit.getScheduler().runTask(this, () -> processChunkCleanup(sender, before, collectionsBefore, startNanos, stats));
+    }
 
-                MemorySnapshot after = MemorySnapshot.capture();
-                long freed = Math.max(0L, before.usedHeap() - after.usedHeap());
-                long committedDrop = Math.max(0L, before.committedHeap() - after.committedHeap());
-                long collections = Math.max(0L, totalCollections() - collectionsBefore);
+    private void processChunkCleanup(CommandSender sender, MemorySnapshot before,
+                                     long collectionsBefore, long startNanos, CleanupStats stats) {
+        int processed = 0;
 
-                Bukkit.getScheduler().runTask(this, () -> {
-                    sender.sendMessage(ChatColor.AQUA + "[RamCleaner] " + ChatColor.GREEN
-                            + "Cleanup complete.");
-                    sender.sendMessage(ChatColor.WHITE + "Actual measured heap freed: "
-                            + ChatColor.GREEN + formatBytes(freed));
-                    sender.sendMessage(ChatColor.WHITE + "Committed heap reduced: "
-                            + ChatColor.GREEN + formatBytes(committedDrop));
-                    sender.sendMessage(ChatColor.WHITE + "GC collections observed: "
-                            + ChatColor.AQUA + collections);
-                    sender.sendMessage(ChatColor.WHITE + "Current used heap: "
-                            + ChatColor.AQUA + formatBytes(after.usedHeap())
-                            + ChatColor.GRAY + " / " + formatBytes(after.maxHeap()));
-                    if (freed == 0L) {
-                        sender.sendMessage(ChatColor.YELLOW
-                                + "[RamCleaner] 0 B was reclaimed. No memory was faked.");
+        for (World world : Bukkit.getWorlds()) {
+            Chunk[] loaded = world.getLoadedChunks();
+            for (Chunk chunk : loaded) {
+                if (processed >= CHUNKS_PER_TICK) {
+                    break;
+                }
+                processed++;
+                stats.loadedSeen++;
+
+                if (canUnload(world, chunk)) {
+                    try {
+                        if (world.unloadChunk(chunk)) {
+                            stats.unloaded++;
+                        } else {
+                            stats.unloadFailed++;
+                        }
+                    } catch (Throwable throwable) {
+                        stats.unloadFailed++;
                     }
-                    cleaning.set(false);
-                });
-            } catch (Throwable throwable) {
-                getLogger().warning("Cleanup failed: " + throwable.getClass().getSimpleName()
-                        + ": " + throwable.getMessage());
-                Bukkit.getScheduler().runTask(this, () -> {
-                    sender.sendMessage(ChatColor.RED
-                            + "[RamCleaner] Cleanup failed safely; no fake value was reported.");
-                    cleaning.set(false);
-                });
+                } else {
+                    stats.protectedChunks++;
+                }
             }
-        });
+            if (processed >= CHUNKS_PER_TICK) {
+                break;
+            }
+        }
+
+        // More chunks may remain. Continue on the next tick without blocking the server.
+        if (hasSafeUnloadCandidates()) {
+            Bukkit.getScheduler().runTask(this,
+                    () -> processChunkCleanup(sender, before, collectionsBefore, startNanos, stats));
+            return;
+        }
+
+        // All safe candidates have been handled. GC requests are deliberately outside the tick thread.
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> finishGarbageCollection(
+                sender, before, collectionsBefore, startNanos, stats));
+    }
+
+    private boolean canUnload(World world, Chunk chunk) {
+        // Never unload a chunk visible to a player.
+        if (!world.getPlayersSeeingChunk(chunk).isEmpty()) {
+            return false;
+        }
+        // Respect force-loaded chunks and plugin chunk tickets.
+        if (chunk.isForceLoaded() || !chunk.getPluginChunkTickets().isEmpty()) {
+            return false;
+        }
+        return world.isChunkLoaded(chunk);
+    }
+
+    private boolean hasSafeUnloadCandidates() {
+        for (World world : Bukkit.getWorlds()) {
+            for (Chunk chunk : world.getLoadedChunks()) {
+                if (canUnload(world, chunk)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void finishGarbageCollection(CommandSender sender, MemorySnapshot before,
+                                         long collectionsBefore, long startNanos, CleanupStats stats) {
+        try {
+            MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+            for (int i = 0; i < GC_PASSES; i++) {
+                memoryBean.gc();
+                System.gc();
+                pause(350L);
+            }
+
+            MemorySnapshot after = MemorySnapshot.capture();
+            long freed = Math.max(0L, before.usedHeap() - after.usedHeap());
+            long committedDrop = Math.max(0L, before.committedHeap() - after.committedHeap());
+            long collections = Math.max(0L, totalCollections() - collectionsBefore);
+            long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+
+            Bukkit.getScheduler().runTask(this, () -> {
+                sender.sendMessage(ChatColor.AQUA + "[RamCleaner] " + ChatColor.GREEN + "Cleanup complete.");
+                sender.sendMessage(ChatColor.WHITE + "Actual measured heap freed: "
+                        + ChatColor.GREEN + formatBytes(freed));
+                sender.sendMessage(ChatColor.WHITE + "Committed heap reduced: "
+                        + ChatColor.GREEN + formatBytes(committedDrop));
+                sender.sendMessage(ChatColor.WHITE + "Loaded chunks unloaded: "
+                        + ChatColor.GREEN + stats.unloaded);
+                sender.sendMessage(ChatColor.WHITE + "Loaded chunks inspected: "
+                        + ChatColor.AQUA + stats.loadedSeen);
+                sender.sendMessage(ChatColor.WHITE + "Chunks protected from unloading: "
+                        + ChatColor.YELLOW + stats.protectedChunks);
+                sender.sendMessage(ChatColor.WHITE + "Unload failures: "
+                        + ChatColor.YELLOW + stats.unloadFailed);
+                sender.sendMessage(ChatColor.WHITE + "GC collections observed: "
+                        + ChatColor.AQUA + collections);
+                sender.sendMessage(ChatColor.WHITE + "Current used heap: "
+                        + ChatColor.AQUA + formatBytes(after.usedHeap())
+                        + ChatColor.GRAY + " / " + formatBytes(after.maxHeap()));
+                sender.sendMessage(ChatColor.WHITE + "Cleanup duration: "
+                        + ChatColor.AQUA + elapsedMs + " ms");
+                if (freed == 0L) {
+                    sender.sendMessage(ChatColor.YELLOW
+                            + "[RamCleaner] 0 B was actually reclaimed from the measured heap. No fake RAM number was reported.");
+                    sender.sendMessage(ChatColor.GRAY
+                            + "Chunks were still unloaded where safe; the JVM may retain committed memory for future allocations.");
+                }
+                cleaning.set(false);
+            });
+        } catch (Throwable throwable) {
+            getLogger().warning("Cleanup failed: " + throwable.getClass().getSimpleName()
+                    + ": " + throwable.getMessage());
+            Bukkit.getScheduler().runTask(this, () -> {
+                sender.sendMessage(ChatColor.RED + "[RamCleaner] Cleanup failed safely; no fake value was reported.");
+                cleaning.set(false);
+            });
+        }
     }
 
     private void sendStatus(CommandSender sender) {
@@ -214,6 +302,7 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
         long max = memory.maxHeap();
         int tracked = 0;
         int throttled = 0;
+        int loadedChunks = 0;
 
         synchronized (originalAware) {
             for (Map.Entry<Mob, Boolean> entry : originalAware.entrySet()) {
@@ -226,20 +315,22 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
                 }
             }
         }
+        for (World world : Bukkit.getWorlds()) {
+            loadedChunks += world.getLoadedChunks().length;
+        }
 
         sender.sendMessage(ChatColor.AQUA + "━━━━━━━━ RamCleaner Status ━━━━━━━━");
-        sender.sendMessage(ChatColor.WHITE + "Live used RAM: " + ChatColor.AQUA + formatBytes(used));
-        sender.sendMessage(ChatColor.WHITE + "Allocated/committed RAM: " + ChatColor.AQUA
-                + formatBytes(committed));
-        sender.sendMessage(ChatColor.WHITE + "Free RAM in allocated heap: " + ChatColor.AQUA
+        sender.sendMessage(ChatColor.WHITE + "Live used heap: " + ChatColor.AQUA + formatBytes(used));
+        sender.sendMessage(ChatColor.WHITE + "Allocated/committed heap: " + ChatColor.AQUA + formatBytes(committed));
+        sender.sendMessage(ChatColor.WHITE + "Free inside committed heap: " + ChatColor.AQUA
                 + formatBytes(Math.max(0L, committed - used)));
-        sender.sendMessage(ChatColor.WHITE + "Free RAM until -Xmx: " + ChatColor.AQUA
+        sender.sendMessage(ChatColor.WHITE + "Free until -Xmx: " + ChatColor.AQUA
                 + formatBytes(Math.max(0L, max - used)));
-        sender.sendMessage(ChatColor.WHITE + "Max RAM (-Xmx): " + ChatColor.AQUA + formatBytes(max));
+        sender.sendMessage(ChatColor.WHITE + "Max heap (-Xmx): " + ChatColor.AQUA + formatBytes(max));
+        sender.sendMessage(ChatColor.WHITE + "Loaded chunks: " + ChatColor.AQUA + loadedChunks);
         sender.sendMessage(ChatColor.WHITE + "Tracked mobs: " + ChatColor.AQUA + tracked);
         sender.sendMessage(ChatColor.WHITE + "AI currently throttled: " + ChatColor.AQUA + throttled);
-        sender.sendMessage(ChatColor.WHITE + "Explicit GC disabled: " + ChatColor.AQUA
-                + explicitGcDisabled());
+        sender.sendMessage(ChatColor.WHITE + "Explicit GC disabled: " + ChatColor.AQUA + explicitGcDisabled());
         sender.sendMessage(ChatColor.AQUA + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
 
@@ -280,6 +371,13 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
             return String.format(Locale.ROOT, "%.1f MB", value);
         }
         return String.format(Locale.ROOT, "%.2f GB", value / 1024.0);
+    }
+
+    private static final class CleanupStats {
+        private int loadedSeen;
+        private int unloaded;
+        private int protectedChunks;
+        private int unloadFailed;
     }
 
     private record MemorySnapshot(long usedHeap, long committedHeap, long maxHeap) {
