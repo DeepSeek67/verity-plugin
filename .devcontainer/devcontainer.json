@@ -1,0 +1,12 @@
+{
+  "name": "RamCleaner Java 21",
+  "image": "mcr.microsoft.com/devcontainers/java:1-21-bookworm",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "vscjava.vscode-java-pack"
+      ]
+    }
+  },
+  "postCreateCommand": "java -version && mvn -version"
+}
