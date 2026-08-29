@@ -7,22 +7,18 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Entity;
-import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Mob;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
+import org.bukkit.event.entity.EntityRemoveFromWorldEvent;
 import org.bukkit.event.world.EntitiesLoadEvent;
-import org.bukkit.event.world.EntitiesUnloadEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
 import java.lang.management.ManagementFactory;
-import java.lang.management.MemoryPoolMXBean;
-import java.lang.management.MemoryUsage;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -31,9 +27,11 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * RamCleaner is deliberately conservative about what it calls "freed" memory.
- * JVM GC is not guaranteed to reclaim a specific amount of memory, so the
- * command reports the measured reduction in used heap after the GC requests.
+ * Lightweight Paper RAM/AI optimizer.
+ *
+ * "Freed" memory is always a measured before/after heap reduction. The plugin
+ * never invents a value because JVM garbage collection is not guaranteed to
+ * reclaim a specific amount of memory.
  */
 public final class RamCleanerPlugin extends JavaPlugin implements Listener, CommandExecutor {
 
@@ -46,26 +44,24 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
     @Override
     public void onEnable() {
         Bukkit.getPluginManager().registerEvents(this, this);
-        getCommand("ramclean").setExecutor(this);
-        getCommand("ramstatus").setExecutor(this);
+        if (getCommand("ramclean") != null) getCommand("ramclean").setExecutor(this);
+        if (getCommand("ramstatus") != null) getCommand("ramstatus").setExecutor(this);
 
-        // One initial scan; afterwards entities are maintained from events.
+        // One startup scan. Afterwards the map is maintained by lifecycle events.
         for (World world : Bukkit.getWorlds()) {
             for (Entity entity : world.getEntities()) {
                 track(entity);
             }
         }
 
-        // Every 10 ticks keeps the hot path small while reacting quickly.
+        // 10 ticks = 500 ms. This avoids an expensive per-tick visibility scan.
         aiTask = Bukkit.getScheduler().runTaskTimer(this, this::updateMobAI, 10L, 10L);
-        getLogger().info("RamCleaner enabled. Adaptive mob AI + measured JVM cleanup active.");
+        getLogger().info("RamCleaner enabled: measured heap cleanup + adaptive mob AI throttling.");
     }
 
     @Override
     public void onDisable() {
-        if (aiTask != null) {
-            aiTask.cancel();
-        }
+        if (aiTask != null) aiTask.cancel();
         restoreAllMobAI();
         mobs.clear();
     }
@@ -82,36 +78,26 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
 
     @EventHandler
     public void onEntitiesLoad(EntitiesLoadEvent event) {
-        for (Entity entity : event.getEntities()) {
-            track(entity);
-        }
+        for (Entity entity : event.getEntities()) track(entity);
     }
 
     @EventHandler
-    public void onEntitiesUnload(EntitiesUnloadEvent event) {
-        for (Entity entity : event.getEntities()) {
-            mobs.remove(entity.getUniqueId());
-        }
+    public void onEntityRemove(EntityRemoveFromWorldEvent event) {
+        mobs.remove(event.getEntity().getUniqueId());
     }
 
     private void track(Entity entity) {
-        if (!(entity instanceof Mob mob)) {
-            return;
-        }
-        if (!mob.isValid()) {
-            return;
-        }
+        if (!(entity instanceof Mob mob) || !mob.isValid()) return;
         mobs.putIfAbsent(mob.getUniqueId(), new MobState(mob, mob.isAware()));
     }
 
     /**
-     * Adaptive AI throttling:
-     * - A mob with no tracked players has its AI disabled.
-     * - If it is tracked, AI stays enabled only while at least one tracking
-     *   player has line of sight to it.
-     * - The check uses Paper's tracking state first, avoiding an O(mobs*players)
-     *   distance scan for the common far-away case.
-     * - State changes only happen when necessary.
+     * AI optimization uses Paper's actual entity tracking set first.
+     *
+     * No tracked players -> the client is not receiving entity updates, so AI
+     * is disabled. If tracked, at least one tracking player must have line of
+     * sight to the mob for AI to remain active. State is changed only when
+     * necessary, keeping this pass very cheap.
      */
     private void updateMobAI() {
         Iterator<Map.Entry<UUID, MobState>> iterator = mobs.entrySet().iterator();
@@ -126,17 +112,13 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
 
             boolean shouldRunAI = false;
             for (Player player : mob.getTrackedBy()) {
-                if (!player.isOnline() || player.isDead()) {
-                    continue;
-                }
+                if (!player.isOnline() || player.isDead()) continue;
                 if (mob.hasLineOfSight(player)) {
                     shouldRunAI = true;
                     break;
                 }
             }
 
-            // Keep the original state semantics: only mobs modified by this
-            // plugin are restored to their original value later.
             if (!shouldRunAI) {
                 if (mob.isAware()) {
                     mob.setAware(false);
@@ -151,9 +133,8 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
 
     private void restoreAllMobAI() {
         for (MobState state : mobs.values()) {
-            Mob mob = state.mob;
-            if (state.modified && mob.isValid()) {
-                mob.setAware(state.originalAware);
+            if (state.modified && state.mob.isValid()) {
+                state.mob.setAware(state.originalAware);
             }
         }
     }
@@ -171,15 +152,14 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
                 return true;
             }
 
-            // MemoryMXBean gives an additional before/after signal, while
-            // Runtime gives the heap values normally useful to server admins.
             MemorySnapshot before = MemorySnapshot.capture();
             sender.sendMessage(ChatColor.AQUA + "[RamCleaner] " + ChatColor.GRAY + "Starting aggressive measured cleanup...");
 
+            // Never block the main server thread with explicit GC requests.
             Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
                 try {
-                    // Two explicit requests separated by a short pause. This is
-                    // intentionally aggressive, but JVM flags may ignore them.
+                    // Multiple requests make the command aggressive, but JVM
+                    // flags/collectors are still allowed to ignore explicit GC.
                     System.gc();
                     sleep(150L);
                     System.gc();
@@ -196,8 +176,9 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
                         sender.sendMessage(ChatColor.GRAY + "[RamCleaner] Used: " + formatBytes(after.usedHeap)
                                 + " / " + formatBytes(after.maxHeap) + " max"
                                 + " | Free headroom: " + formatBytes(after.maxHeap - after.usedHeap));
+
                         if (before.usedHeap <= after.usedHeap) {
-                            sender.sendMessage(ChatColor.YELLOW + "[RamCleaner] JVM reclaimed no measurable heap this run; no memory was faked.");
+                            sender.sendMessage(ChatColor.YELLOW + "[RamCleaner] No measurable heap was reclaimed this run; no memory was faked.");
                         }
                         cleaning.set(false);
                     });
@@ -232,9 +213,7 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
     private int countThrottledMobs() {
         int count = 0;
         for (MobState state : mobs.values()) {
-            if (state.modified && state.mob.isValid() && !state.mob.isAware()) {
-                count++;
-            }
+            if (state.modified && state.mob.isValid() && !state.mob.isAware()) count++;
         }
         return count;
     }
@@ -257,13 +236,9 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
     }
 
     private static String formatBytes(long bytes) {
-        if (bytes < MB) {
-            return bytes + " B";
-        }
+        if (bytes < MB) return bytes + " B";
         double value = bytes / (double) MB;
-        if (value < 1024) {
-            return String.format(java.util.Locale.ROOT, "%.1f MB", value);
-        }
+        if (value < 1024) return String.format(java.util.Locale.ROOT, "%.1f MB", value);
         return String.format(java.util.Locale.ROOT, "%.2f GB", value / 1024.0);
     }
 
@@ -292,10 +267,8 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
         private static MemorySnapshot capture() {
             Runtime runtime = Runtime.getRuntime();
             long allocated = runtime.totalMemory();
-            long free = runtime.freeMemory();
-            long used = Math.max(0L, allocated - free);
-            long max = runtime.maxMemory();
-            return new MemorySnapshot(used, allocated, max);
+            long used = Math.max(0L, allocated - runtime.freeMemory());
+            return new MemorySnapshot(used, allocated, runtime.maxMemory());
         }
     }
 }
