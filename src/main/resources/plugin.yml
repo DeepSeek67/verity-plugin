@@ -1,0 +1,20 @@
+name: RamCleaner
+version: 1.0.0
+main: dev.deepseek67.ramcleaner.RamCleanerPlugin
+api-version: '1.21'
+author: DeepSeek67
+description: Lightweight heap cleanup and adaptive mob AI throttling for Paper.
+commands:
+  ramclean:
+    description: Aggressively requests JVM garbage collection and performs safe cleanup.
+    usage: /ramclean
+    permission: ramcleaner.clean
+  ramstatus:
+    description: Shows live JVM memory usage.
+    usage: /ramstatus
+    permission: ramcleaner.status
+permissions:
+  ramcleaner.clean:
+    default: op
+  ramcleaner.status:
+    default: op
