@@ -13,7 +13,6 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
-import org.bukkit.event.entity.EntityRemoveFromWorldEvent;
 import org.bukkit.event.world.EntitiesLoadEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
@@ -85,11 +84,6 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
 
     @EventHandler
     public void onEntityDeath(EntityDeathEvent event) {
-        originalAware.remove(event.getEntity());
-    }
-
-    @EventHandler
-    public void onEntityRemove(EntityRemoveFromWorldEvent event) {
         originalAware.remove(event.getEntity());
     }
 
@@ -171,8 +165,6 @@ public final class RamCleanerPlugin extends JavaPlugin implements Listener, Comm
 
         Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
             try {
-                // Three explicit requests are intentionally aggressive, but the JVM
-                // is still free to decide whether and when to collect.
                 System.gc();
                 pause(150L);
                 System.gc();
